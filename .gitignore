@@ -3,3 +3,6 @@ cache/
 __pycache__/
 frames/
 blink.gif
+node_modules/
+dist/
+__MACOSX/
