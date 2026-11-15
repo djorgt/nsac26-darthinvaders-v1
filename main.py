@@ -24,13 +24,16 @@ for sub in ["queries", "epochs", "raw", "stack", "gaia"]:
     os.makedirs(f"{CACHE}/{sub}", exist_ok=True)
 
 BANDS = [f"SPHEREx-D{i}" for i in range(1, 7)]
-PIXSCALE = 6.2          
-CUTOUT_MARGIN = 1.5    
-MJD_J2016 = 57388.0     
+PIXSCALE = 6.2
+CUTOUT_MARGIN = 1.5
+MJD_J2016 = 57388.0
 
 app = FastAPI(title="SPHEREx Sky Change API", version="2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 pool = ThreadPoolExecutor(max_workers=6)
+tap_pool = ThreadPoolExecutor(max_workers=8)
+TAP_TIMEOUT = 45
+
 
 def key_of(text: str) -> str:
     return hashlib.sha1(text.encode()).hexdigest()[:16]
@@ -41,7 +44,6 @@ def mjd_to_date(mjd: float) -> str:
 
 
 def make_grid(ra: float, dec: float, size: float):
-    """A north-up, east-left TAN grid centred on (ra, dec)."""
     npix = max(16, int(round(size * 3600 / PIXSCALE)))
     w = WCS(naxis=2)
     w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
@@ -52,7 +54,6 @@ def make_grid(ra: float, dec: float, size: float):
 
 
 def shifted_center(ra, dec, pmra, pmdec, mjd, t0):
-    """Move the grid with a star's proper motion (mas/yr) so the star stays still."""
     if not (pmra or pmdec) or t0 is None:
         return ra, dec
     dt = (mjd - t0) / 365.25
@@ -60,8 +61,8 @@ def shifted_center(ra, dec, pmra, pmdec, mjd, t0):
     ra2 = ra + pmra * dt / 3.6e6 / max(math.cos(math.radians(dec)), 1e-6)
     return ra2, dec2
 
+
 def search_irsa(ra: float, dec: float, band: str, size: float):
-    """All SPHEREx images covering (ra, dec) in one band: list of (cutout_url, mjd)."""
     cut = round(size * CUTOUT_MARGIN, 4)
     qfile = f"{CACHE}/queries/{key_of(f'{ra:.5f},{dec:.5f},{band},{cut}')}.json"
     if os.path.exists(qfile):
@@ -79,12 +80,13 @@ def search_irsa(ra: float, dec: float, band: str, size: float):
     ORDER BY p.time_bounds_lower
     """
     t, last = None, None
-    for attempt, use_async in enumerate([False, True, False, True]):
+    for attempt, use_async in enumerate([False, True, False]):
         try:
-            t = Irsa.query_tap(query, async_job=use_async).to_table()
+            job = tap_pool.submit(lambda a=use_async: Irsa.query_tap(query, async_job=a).to_table())
+            t = job.result(timeout=TAP_TIMEOUT)
             break
         except Exception as e:
-            last = e
+            last = e if str(e) else "no answer within %d s" % TAP_TIMEOUT
             time.sleep(2 * (attempt + 1))
     if t is None:
         raise RuntimeError(f"NASA's IRSA archive is busy or down right now ({last})")
@@ -95,7 +97,6 @@ def search_irsa(ra: float, dec: float, band: str, size: float):
 
 
 def group_epochs(rows, window_days: float, per_epoch: int):
-    """Group images taken within `window_days` of each other (WiseView 'window')."""
     groups, cur = [], []
     for url, mjd in rows:
         if cur and mjd - cur[0][1] > window_days:
@@ -107,7 +108,6 @@ def group_epochs(rows, window_days: float, per_epoch: int):
 
     epochs = []
     for g in groups:
-        # keep at most per_epoch images, spread over the group
         idx = np.unique(np.linspace(0, len(g) - 1, min(per_epoch, len(g))).astype(int))
         members = [g[i] for i in idx]
         epochs.append({
@@ -117,8 +117,8 @@ def group_epochs(rows, window_days: float, per_epoch: int):
         })
     return epochs
 
+
 def download_raw(url: str):
-    """Download one cutout: zodi-subtracted IMAGE + header. Cached as a small FITS file."""
     path = f"{CACHE}/raw/{key_of(url)}.fits"
     if os.path.exists(path):
         with fits.open(path) as h:
@@ -138,7 +138,7 @@ def download_raw(url: str):
                     pass
             fits.HDUList([fits.PrimaryHDU(), fits.ImageHDU(img, hdr, name="IMAGE")]).writeto(path, overwrite=True)
             return img, hdr
-        except Exception as e:  # IRSA sometimes answers 503 when busy
+        except Exception as e:
             last = e
             time.sleep(2 + 2 * attempt)
     raise RuntimeError(f"download failed: {last}")
@@ -157,7 +157,6 @@ def bilinear(img, x, y):
 
 
 def reproject(img, hdr, grid_wcs, npix):
-    """Put one cutout onto the common grid."""
     src = WCS(hdr, naxis=2)
     yy, xx = np.mgrid[0:npix, 0:npix]
     gra, gdec = grid_wcs.pixel_to_world_values(xx, yy)
@@ -174,7 +173,6 @@ def load_epoch(eid: str):
 
 
 def epoch_image(eid: str, pmra=0.0, pmdec=0.0, t0=None):
-    """Median-combined, re-projected image of one epoch (cached)."""
     ep = load_epoch(eid)
     ra, dec = shifted_center(ep["ra"], ep["dec"], pmra, pmdec, ep["mjd"], t0)
     grid_wcs, npix = make_grid(ra, dec, ep["size"])
@@ -200,13 +198,11 @@ def epoch_image(eid: str, pmra=0.0, pmdec=0.0, t0=None):
 
 
 def render(data, stretch, minbright, maxbright, invert, zoom, diff=False, limits=None):
-    """Turn numbers into a grey PNG."""
     finite = data[np.isfinite(data)]
     if finite.size == 0:
         finite = np.zeros(1)
 
     if diff:
-        # symmetric around zero: grey = no change, white = got brighter, black = got fainter
         lim = limits if limits else float(np.percentile(np.abs(finite), maxbright)) or 1.0
         x = np.clip((np.nan_to_num(data, nan=0.0) / lim + 1) / 2, 0, 1)
     else:
@@ -222,12 +218,13 @@ def render(data, stretch, minbright, maxbright, invert, zoom, diff=False, limits
 
     if invert:
         x = 1 - x
-    img = Image.fromarray(np.flipud(x * 255).astype(np.uint8))  # north up
+    img = Image.fromarray(np.flipud(x * 255).astype(np.uint8))
     if zoom > 1:
         img = img.resize((img.width * zoom, img.height * zoom), Image.NEAREST)
     buf = io.BytesIO()
     img.save(buf, "PNG")
     return buf.getvalue()
+
 
 @app.get("/bands")
 def bands():
@@ -244,7 +241,6 @@ def frames(
     window: float = Query(3.0, ge=0, le=200, description="Images within this many days form one epoch"),
     per_epoch: int = Query(3, ge=1, le=10, description="Max images combined per epoch"),
 ):
-    """List epochs (groups of SPHEREx images close in time) covering (ra, dec)."""
     if band not in BANDS:
         raise HTTPException(400, f"band must be one of {BANDS}")
     ra = ra % 360
@@ -292,7 +288,6 @@ def frame_png(
     pmdec: float = Query(0.0, description="Track proper motion in Dec (mas/yr)"),
     t0: float = Query(None, description="Reference MJD for proper-motion tracking (usually the first epoch)"),
 ):
-    """One epoch as a PNG, with WiseView-style display options."""
     data = epoch_image(eid, pmra, pmdec, t0)
     limits = None
 
@@ -321,7 +316,6 @@ def gaia(
     maglim: float = Query(17.0, description="Faintest Gaia G magnitude"),
     mjd: float = Query(None, description="Move stars to this date using their proper motion"),
 ):
-    """Known Gaia DR3 stars, as pixel positions in the images (top-left origin)."""
     ra = ra % 360
     gfile = f"{CACHE}/gaia/{key_of(f'{ra:.5f},{dec:.5f},{size},{maglim}')}.json"
     if os.path.exists(gfile):
@@ -338,13 +332,13 @@ def gaia(
               AND phot_g_mean_mag < {maglim}
             """
             t = Gaia.launch_job(q).get_results()
-            col = {c.lower(): c for c in t.colnames}  # column names can be upper or lower case
+            col = {c.lower(): c for c in t.colnames}
 
             def num(r, name):
                 try:
                     v = float(r[col[name]])
                     return v if math.isfinite(v) else 0.0
-                except Exception:  # masked / missing value
+                except Exception:
                     return 0.0
 
             stars = []
@@ -367,7 +361,7 @@ def gaia(
         sdec = s["dec"] + s["pmdec"] * dt / 3.6e6
         sra = s["ra"] + s["pmra"] * dt / 3.6e6 / max(math.cos(math.radians(s["dec"])), 1e-6)
         x, y = grid_wcs.world_to_pixel_values(sra, sdec)
-        y = npix - 1 - y  # images are flipped so north is up
+        y = npix - 1 - y
         if -1 <= x <= npix and -1 <= y <= npix:
             out.append({**s, "x": float(x), "y": float(y)})
     return {"npix": npix, "stars": out}
@@ -375,13 +369,13 @@ def gaia(
 
 @app.get("/resolve")
 def resolve(name: str = Query(..., min_length=1, description="Object name, e.g. 'M101' or 'Vega'")):
-    """Look up an object's coordinates by name (CDS Sesame). Positions are for the year 2000."""
     try:
         from astropy.coordinates import SkyCoord
         c = SkyCoord.from_name(name)
         return {"name": name, "ra": float(c.ra.deg), "dec": float(c.dec.deg)}
     except Exception as e:
         raise HTTPException(404, f"Unknown object: {e}")
+
 
 VIEWER = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -391,7 +385,6 @@ VIEWER = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font-family:Roboto,"Segoe UI",Arial,sans-serif;font-size:14px}
 button,input,select{font:inherit}
-/* header */
 header{display:flex;align-items:center;gap:18px;padding:14px 26px 10px}
 .brand{font-size:44px;font-weight:700;color:var(--blue);letter-spacing:.5px}
 .title{font-size:23px;font-weight:700;margin-top:10px}
@@ -399,7 +392,6 @@ header{display:flex;align-items:center;gap:18px;padding:14px 26px 10px}
 .team{line-height:1.15;font-size:20px}.team span{color:var(--blue)}.team b{color:var(--red);display:block}
 .divider{width:3px;height:52px;background:#fff;margin:0 10px}
 .event{color:var(--blue);font-weight:700;font-size:23px;line-height:1.15}
-/* layout */
 .grid{display:grid;grid-template-columns:240px minmax(0,1fr) 210px;gap:20px;padding:4px 26px 24px;align-items:start}
 @media(max-width:1100px){.grid{grid-template-columns:240px minmax(0,1fr)}.right{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr;gap:14px}}
 @media(max-width:760px){.grid{grid-template-columns:1fr}.right{grid-template-columns:1fr}header{flex-wrap:wrap}}
@@ -415,7 +407,6 @@ input[type=checkbox]{width:13px;height:13px;accent-color:var(--blue)}
 .btn{background:#3b82d6;color:#000;border:0;border-radius:8px;padding:7px 12px;font-weight:600;cursor:pointer}
 .btn:disabled{opacity:.5;cursor:wait}
 .ghost{background:var(--field);color:#b3aaaa;border:0;border-radius:6px;padding:4px 8px;font-size:13px;cursor:pointer}
-/* centre */
 .chips{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 14px 28px}
 .chip{background:var(--field);border:1.5px solid var(--line);color:#e8eef5;border-radius:99px;padding:4px 12px;font-size:13px;cursor:pointer}
 .chip.on{background:#1d3b5a;border-color:var(--blue);color:#fff;font-weight:700}
@@ -437,7 +428,6 @@ input[type=checkbox]{width:13px;height:13px;accent-color:var(--blue)}
 .legend{display:flex;gap:40px;margin-left:28px;font-size:12px;color:var(--soft);flex-wrap:wrap}
 .legend span{display:flex;align-items:center;gap:6px}
 .legend i{width:11px;height:11px;border-radius:2px;display:inline-block}
-/* right */
 .right .panel+.panel{margin-top:14px}
 .about p{margin:4px 0 6px;font-weight:700;font-size:14px;line-height:1.35}
 .about ul{margin:0;padding:0;list-style:none;font-size:12.5px;line-height:1.45;color:#e8eef5}
@@ -455,7 +445,6 @@ input[type=checkbox]{width:13px;height:13px;accent-color:var(--blue)}
 </header>
 
 <main class="grid">
-  <!-- LEFT: controls -->
   <aside class="panel">
     <div class="row" style="margin-top:0">Data source</div>
     <div class="source" title="All images come from NASA's SPHEREx all-sky survey (IRSA archive)">SPHEREx All-Sky Survey</div>
@@ -482,7 +471,6 @@ input[type=checkbox]{width:13px;height:13px;accent-color:var(--blue)}
     <div class="row">Speed <input id="f_speed" type="range" min="150" max="2000" step="50" value="600" style="direction:rtl"></div>
   </aside>
 
-  <!-- CENTRE: viewer -->
   <section>
     <div class="chips" id="chips"></div>
     <div class="stage">
@@ -507,7 +495,6 @@ input[type=checkbox]{width:13px;height:13px;accent-color:var(--blue)}
     </div>
   </section>
 
-  <!-- RIGHT: extras + about -->
   <aside class="right">
     <div class="panel">
       <h3>Extras</h3>
@@ -539,9 +526,8 @@ input[type=checkbox]{width:13px;height:13px;accent-color:var(--blue)}
 
 <script>
 const $=id=>document.getElementById(id);
-const PIX=6.2; // arcsec per pixel, same as the backend
+const PIX=6.2;
 const FIELDS=['ra','dec','size','band','window','n','per','stretch','min','max','lock','invert','diff','zoom','speed','gaia','pmra','pmdec'];
-// Approximate positions for 2026 (fast stars have moved since the year 2000)
 const TARGETS={
   barnard:{name:"Barnard's Star",ra:269.446,dec:4.768,band:"SPHEREx-D2"},
   wise0855:{name:"WISE 0855",ra:133.770,dec:-7.243,band:"SPHEREx-D6"},
@@ -556,13 +542,11 @@ function val(k){const e=$('f_'+k);return e.type==='checkbox'?e.checked:e.value}
 function setv(k,v){const e=$('f_'+k);if(!e)return;if(e.type==='checkbox')e.checked=(v==='1'||v===true);else e.value=v}
 function say(t,err){$('msg').textContent=t;$('msg').className=err?'err':''}
 
-// quick targets
 $('chips').innerHTML=Object.entries(TARGETS).map(([k,t])=>`<button class="chip" data-k="${k}" onclick="pick('${k}')">${t.name}</button>`).join('');
 function paintChips(){document.querySelectorAll('.chip').forEach(c=>c.classList.toggle('on',c.dataset.k===active))}
 function pick(k){const t=TARGETS[k];active=k;setv('ra',t.ra);setv('dec',t.dec);setv('band',t.band);mark=null;$('markinfo').textContent='';paintChips();load()}
 ['f_ra','f_dec'].forEach(id=>$(id).addEventListener('input',()=>{active='';paintChips()}));
 
-// share link (all settings live in the URL)
 function writeHash(){const p=new URLSearchParams();FIELDS.forEach(k=>{let v=val(k);if(typeof v==='boolean')v=v?'1':'0';p.set(k,v)});
   if(active)p.set('t',active);if(mark)p.set('mark',mark.x.toFixed(1)+','+mark.y.toFixed(1));history.replaceState(null,'','#'+p)}
 function readHash(){if(location.hash.length<2)return;const p=new URLSearchParams(location.hash.slice(1));
@@ -570,11 +554,10 @@ function readHash(){if(location.hash.length<2)return;const p=new URLSearchParams
   if(p.has('mark')){const [x,y]=p.get('mark').split(',').map(Number);mark={x,y}}paintChips();if(p.has('ra'))load()}
 function copyLink(){writeHash();navigator.clipboard.writeText(location.href).then(()=>say('Share link copied!'),()=>say(location.href))}
 
-// image urls
 function src(k){
   const f=frames[k],p=new URLSearchParams({stretch:val('stretch'),minbright:val('min'),maxbright:val('max'),invert:val('invert')});
   const a=+val('pmra')||0,b=+val('pmdec')||0;
-  if(a||b){p.set('pmra',a);p.set('pmdec',b);p.set('t0',frames[0].mjd)}   // proper-motion tracking
+  if(a||b){p.set('pmra',a);p.set('pmdec',b);p.set('t0',frames[0].mjd)}
   const d=val('diff');
   if(d==='first'&&k>0)p.set('diff',frames[0].id);
   if(d==='prev'&&k>0)p.set('diff',frames[k-1].id);
@@ -589,7 +572,9 @@ async function load(){
   $('loadbtn').disabled=true;say('');
   const q=new URLSearchParams({ra:val('ra'),dec:val('dec'),band:val('band'),size:val('size'),n:val('n'),window:val('window'),per_epoch:val('per')});
   try{
-    const r=await fetch('/frames?'+q),j=await r.json();
+    const ctl=new AbortController(),tm=setTimeout(()=>ctl.abort(),200000);
+    let r;try{r=await fetch('/frames?'+q,{signal:ctl.signal})}catch(err){throw new Error(err.name==='AbortError'?'IRSA did not answer in time':err.message)}finally{clearTimeout(tm)}
+    const j=await r.json();
     if(!r.ok)throw new Error(j.detail||r.status);
     if(!j.frames.length){$('empty').textContent='No SPHEREx images of this spot in this band yet. Try another band.';return}
     frames=j.frames;npix=j.npix;
@@ -597,7 +582,7 @@ async function load(){
     await refresh(true);
     say(`${j.count_total} SPHEREx images · ${j.epochs_total} epochs · ${frames[0].date} to ${frames[frames.length-1].date}`);
   }catch(e){
-    const busy=/IRSA|502|503|Proxy/i.test(e.message);
+    const busy=/IRSA|502|503|504|Proxy|time/i.test(e.message);
     $('empty').innerHTML=busy
       ?'NASA\'s IRSA archive is busy right now (too many people using it).<br>Wait a minute and press <b>Load</b> again. Targets you loaded before still work.'
       :'Something went wrong: '+e.message+'.<br>Is the backend (uvicorn) still running?';
@@ -643,7 +628,6 @@ function restartTimer(){clearInterval(timer);timer=setInterval(()=>{if(playing&&
 $('f_speed').addEventListener('input',()=>{restartTimer();writeHash()});
 $('f_zoom').addEventListener('input',()=>{show(cur);writeHash()});
 
-// "I found something moving!": click on the dot to mark it
 function toggleMark(){
   if(!frames.length){say('Load a spot first.',true);return}
   marking=!marking;playing=!marking;
