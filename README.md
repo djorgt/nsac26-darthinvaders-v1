@@ -1,2 +1,5 @@
-# nsac26-darthinvaders-v1
-Main Repo for team Darth Invaders
+# SPHEREx Sky Change Explorer
+### NASA Space Apps Challenge 2026
+### Team Darth Invaders
+
+This webtool is visible at https://darthinvaders.earth
