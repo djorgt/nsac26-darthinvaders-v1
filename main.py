@@ -8,6 +8,8 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+import astropy.units as u
+from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.time import Time
 from astropy.wcs import WCS, FITSFixedWarning
@@ -79,18 +81,44 @@ def search_irsa(ra: float, dec: float, band: str, size: float):
       AND p.energy_bandpassname = '{band}'
     ORDER BY p.time_bounds_lower
     """
-    t, last = None, None
-    for attempt, use_async in enumerate([False, True, False]):
+    def tap(use_async):
+        t = Irsa.query_tap(query, async_job=use_async).to_table()
+        return [(str(r["url"]), float(r["mjd"])) for r in t if np.isfinite(float(r["mjd"]))]
+
+    def sia():
+        coord = SkyCoord(ra, dec, unit="deg")
+        found = {}
+        for coll in ["spherex_qr2", "spherex_qr"]:
+            try:
+                res = Irsa.query_sia(pos=(coord, 1 * u.arcsec), collection=coll)
+            except Exception:
+                continue
+            t = res.to_table() if hasattr(res, "to_table") else res
+            for r in t:
+                if str(r["energy_bandpassname"]) != band:
+                    continue
+                mjd = float(r["t_min"])
+                if not np.isfinite(mjd):
+                    continue
+                url = str(r["access_url"])
+                url += ("&" if "?" in url else "?") + f"center={ra},{dec}d&size={cut}"
+                found.setdefault(round(mjd, 4), (url, mjd))
+            if found:
+                break
+        if not found:
+            raise RuntimeError("SIA search found nothing")
+        return sorted(found.values(), key=lambda x: x[1])
+
+    rows, last = None, None
+    for attempt, fn in enumerate([lambda: tap(False), sia, lambda: tap(True)]):
         try:
-            job = tap_pool.submit(lambda a=use_async: Irsa.query_tap(query, async_job=a).to_table())
-            t = job.result(timeout=TAP_TIMEOUT)
+            rows = tap_pool.submit(fn).result(timeout=TAP_TIMEOUT)
             break
         except Exception as e:
             last = e if str(e) else "no answer within %d s" % TAP_TIMEOUT
-            time.sleep(2 * (attempt + 1))
-    if t is None:
+            time.sleep(1 + attempt)
+    if rows is None:
         raise RuntimeError(f"NASA's IRSA archive is busy or down right now ({last})")
-    rows = [(str(r["url"]), float(r["mjd"])) for r in t if np.isfinite(float(r["mjd"]))]
     with open(qfile, "w") as f:
         json.dump(rows, f)
     return rows
